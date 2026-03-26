@@ -1,27 +1,26 @@
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
+use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, QueryParser, RangeQuery};
 use tantivy::schema::*;
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
-// Flutter에서 사용할 문서 구조체
+// Datenstrukturen fuer Flutter
 #[derive(Debug, Clone)]
 pub struct Document {
     pub id: String,
     pub text: String,
 }
 
-// Flutter에서 사용할 검색 결과 구조체
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub score: f32,
     pub doc: Document,
 }
 
-// Tantivy의 핵심 로직을 관리하는 구조체
 struct TantivyApi {
     index: Index,
     writer: Mutex<IndexWriter>,
@@ -31,16 +30,12 @@ struct TantivyApi {
     text_field: Field,
 }
 
-// 전역 상태를 Lazy와 Arc<Mutex<...>>로 안전하게 관리
 static STATE: Lazy<Arc<Mutex<Option<TantivyApi>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
-// Tantivy 인덱스를 초기화하는 함수
-// 초기화는 빠른 작업이므로 sync로 처리
 #[flutter_rust_bridge::frb(sync)]
 pub fn init_tantivy(dir_path: String) -> Result<()> {
     let mut state_lock = STATE.lock().unwrap();
     if state_lock.is_some() {
-        // 이미 초기화된 경우
         return Ok(());
     }
 
@@ -48,28 +43,27 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
     std::fs::create_dir_all(&index_dir)?;
 
     let (index, schema) = if index_dir.join("meta.json").exists() {
-        // 기존 인덱스 열기
         let index = Index::open_in_dir(&index_dir)?;
         let schema = index.schema();
         (index, schema)
     } else {
-        // 새 인덱스 생성
         let mut schema_builder = Schema::builder();
-        // ID 필드는 고유 식별자로 사용되며, 검색 가능하고 저장됩니다.
         schema_builder.add_text_field("id", STRING | STORED);
-        // Text 필드는 전문 검색을 위해 사용됩니다.
         schema_builder.add_text_field("text", TEXT | STORED);
         let schema = schema_builder.build();
         let index = Index::create_in_dir(&index_dir, schema.clone())?;
         (index, schema)
     };
 
-    let id_field = schema.get_field("id").map_err(|_| anyhow!("'id' field not found"))?;
-    let text_field = schema.get_field("text").map_err(|_| anyhow!("'text' field not found"))?;
+    let id_field = schema
+        .get_field("id")
+        .map_err(|_| anyhow!("'id' field not found"))?;
+    let text_field = schema
+        .get_field("text")
+        .map_err(|_| anyhow!("'text' field not found"))?;
 
-    let writer = index.writer(50_000_000)?; // 50MB heap
+    let writer = index.writer(50_000_000)?;
 
-    // Reader를 생성하고 OnCommit 정책으로 자동 리로드
     let reader = index
         .reader_builder()
         .reload_policy(ReloadPolicy::Manual)
@@ -89,53 +83,294 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
     Ok(())
 }
 
-// [CREATE] 새 문서를 추가하는 함수
-// 즉시 commit하므로 단일 문서 추가에 적합
-// 대량 추가는 add_documents_batch 사용 권장
-pub fn add_document(doc: Document) -> Result<()> {
-    let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+/// Erkennt Einzelwort-Wildcards (z.B. "heterozygot*") im Query-String
+/// und ersetzt sie durch Range-Queries, da Tantivys QueryParser fuer
+/// Einzelwort-Prefixe einen PhrasePrefixRequiresAtLeastTwoTerms-Fehler wirft.
+///
+/// Bei Multi-Wort-Phrasen mit Prefix ("big bad wo"*) bleibt PhrasePrefixQuery
+/// via den normalen QueryParser erhalten.
+fn build_prefix_range_query(field: Field, prefix_text: &str) -> Box<dyn tantivy::query::Query> {
+    // Tantivy's default tokenizer: lowercase
+    let lower = prefix_text.to_lowercase();
+    let lower_term = Term::from_field_text(field, &lower);
 
-    let mut writer = api.writer.lock().unwrap();
+    // Obere Grenze: letztes Byte inkrementieren
+    // Wir bauen den upper-bound Term ueber from_field_text mit dem inkrementierten String.
+    let upper_bound = {
+        let bytes = lower.as_bytes();
+        let mut end = bytes.to_vec();
+        while let Some(last) = end.last_mut() {
+            if *last < 0xFF {
+                *last += 1;
+                break;
+            } else {
+                end.pop();
+            }
+        }
+        if end.is_empty() {
+            Bound::Unbounded
+        } else {
+            // end ist jetzt ein UTF-8-aehnliches Byte-Array. Fuer rein ASCII-Prefixe
+            // (was bei medizinischen Termen der Fall ist) ist das valides UTF-8.
+            // Fuer nicht-ASCII nutzen wir den naechsten gueltigen String.
+            match String::from_utf8(end) {
+                Ok(end_str) => Bound::Excluded(Term::from_field_text(field, &end_str)),
+                Err(_) => {
+                    // Fallback: unbounded (findet evtl. etwas zu viel, aber korrekt)
+                    Bound::Unbounded
+                }
+            }
+        }
+    };
 
-    // 추가하기 전에 동일한 ID의 문서가 있다면 삭제 (Update-or-Insert)
-    let id_term = Term::from_field_text(api.id_field, &doc.id);
-    writer.delete_term(id_term.clone());
-
-    let mut tantivy_doc = TantivyDocument::new();
-    tantivy_doc.add_text(api.id_field, &doc.id);
-    tantivy_doc.add_text(api.text_field, &doc.text);
-
-    writer.add_document(tantivy_doc)?;
-    writer.commit()?;
-
-    Ok(())
+    Box::new(RangeQuery::new(Bound::Included(lower_term), upper_bound))
 }
 
-// [READ] 쿼리로 문서를 검색하는 함수
+/// Zerlegt den Query-String, findet Einzelwort-Wildcards und baut einen
+/// kombinierten Query: Range-Queries fuer Wildcards, QueryParser fuer den Rest.
+fn build_query_with_wildcard_fix(
+    index: &Index,
+    text_field: Field,
+    raw_query: &str,
+) -> Result<Box<dyn tantivy::query::Query>> {
+    // Tokenize the query manually to find single-word wildcards like "pathogen*"
+    // vs multi-word phrases or other syntax
+    //
+    // Strategie: Wir parsen den Query mit parse_query_lenient und ersetzen
+    // fehlgeschlagene Wildcard-Terme durch Range-Queries.
+    //
+    // Einfacher Ansatz: Wir splitten den Query an Whitespace und AND/OR/NOT,
+    // erkennen Einzelwort-Wildcards, und bauen den finalen Query zusammen.
+
+    // Pruefe ob ueberhaupt ein Wildcard im Query vorkommt
+    if !raw_query.contains('*') {
+        // Kein Wildcard – normaler QueryParser reicht
+        let query_parser = QueryParser::for_index(index, vec![text_field]);
+        let query = query_parser.parse_query(raw_query)?;
+        return Ok(query);
+    }
+
+    // Strategie: parse_query_lenient nutzen. Das gibt uns einen Query + Fehlerliste.
+    // Wenn Fehler vom Typ PhrasePrefixRequiresAtLeastTwoTerms auftreten, wissen wir
+    // dass Einzelwort-Wildcards gescheitert sind.
+    //
+    // Problem: lenient mode verwirft die fehlgeschlagenen Leaves komplett.
+    // Wir muessen die Wildcards daher VOR dem Parsen extrahieren und separat behandeln.
+
+    // Schritt 1: Extrahiere alle Einzelwort-Wildcard-Terme
+    // Ein Einzelwort-Wildcard ist: ein Token das mit * endet, kein Leerzeichen enthaelt,
+    // und nicht in Anfuehrungszeichen steht.
+    let mut wildcard_prefixes: Vec<String> = Vec::new();
+    let mut remaining_parts: Vec<String> = Vec::new();
+    let mut in_quotes = false;
+
+    for ch in raw_query.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+        }
+    }
+    // Reset – wir brauchen einen tokenbasierten Ansatz
+    in_quotes = false;
+
+    // Einfacher State-Machine-Parser
+    let mut current_token = String::new();
+    let mut result_tokens: Vec<String> = Vec::new();
+
+    for ch in raw_query.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current_token.push(ch);
+        } else if ch.is_whitespace() && !in_quotes {
+            if !current_token.is_empty() {
+                result_tokens.push(current_token.clone());
+                current_token.clear();
+            }
+        } else {
+            current_token.push(ch);
+        }
+    }
+    if !current_token.is_empty() {
+        result_tokens.push(current_token);
+    }
+
+    // Schritt 2: Identifiziere Einzelwort-Wildcards vs Rest
+    for token in &result_tokens {
+        let trimmed = token.trim();
+        // Ist es ein Einzelwort-Wildcard? (kein Operator, keine Klammer-only, endet mit *)
+        if trimmed.ends_with('*')
+            && !trimmed.starts_with('"')
+            && trimmed != "*"
+            && !trimmed.eq_ignore_ascii_case("AND")
+            && !trimmed.eq_ignore_ascii_case("OR")
+            && !trimmed.eq_ignore_ascii_case("NOT")
+        {
+            // Strip fuehrende +/- und Klammern
+            let cleaned = trimmed
+                .trim_start_matches('+')
+                .trim_start_matches('-')
+                .trim_start_matches('(')
+                .trim_end_matches(')');
+            // Entferne field-prefix wie "text:"
+            let prefix_text = if let Some(pos) = cleaned.find(':') {
+                &cleaned[pos + 1..]
+            } else {
+                cleaned
+            };
+            // Entferne das abschliessende *
+            let prefix = prefix_text.trim_end_matches('*');
+            if !prefix.is_empty() {
+                wildcard_prefixes.push(prefix.to_string());
+                // Ersetze den Wildcard im remaining Query durch einen Platzhalter
+                // der garantiert matcht (wir verknuepfen spaeter per AND)
+                remaining_parts.push("*".to_string()); // Tantivy's "match all"
+            } else {
+                remaining_parts.push(trimmed.to_string());
+            }
+        } else {
+            remaining_parts.push(trimmed.to_string());
+        }
+    }
+
+    if wildcard_prefixes.is_empty() {
+        // Keine echten Einzelwort-Wildcards gefunden – normaler Parser
+        let query_parser = QueryParser::for_index(index, vec![text_field]);
+        let query = query_parser.parse_query(raw_query)?;
+        return Ok(query);
+    }
+
+    // Schritt 3: Parse den Rest-Query (ohne Wildcards, mit * als Match-All)
+    let remaining_query = remaining_parts.join(" ");
+
+    // Baue den Rest-Query. Ersetze die "*" Platzhalter nicht – sie matchen alles,
+    // was OK ist, weil wir die Wildcards separat per AND verknuepfen.
+    // Allerdings wollen wir die Semantik (AND/OR/NOT) erhalten.
+    //
+    // Besserer Ansatz: Entferne die *-Platzhalter und baue den restlichen Query
+    // nur aus den nicht-Wildcard-Termen.
+    let non_wildcard_parts: Vec<&str> = result_tokens
+        .iter()
+        .filter(|t| {
+            let trimmed = t.trim();
+            // Behalte alles ausser Einzelwort-Wildcards
+            !(trimmed.ends_with('*')
+                && !trimmed.starts_with('"')
+                && trimmed != "*"
+                && !trimmed.eq_ignore_ascii_case("AND")
+                && !trimmed.eq_ignore_ascii_case("OR")
+                && !trimmed.eq_ignore_ascii_case("NOT"))
+        })
+        .map(|s| s.as_str())
+        .collect();
+
+    // Entferne alleinstehende Operatoren am Anfang/Ende
+    let clean_non_wildcard = clean_dangling_operators(&non_wildcard_parts);
+
+    let mut must_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+
+    // Range-Queries fuer jede Wildcard
+    for prefix in &wildcard_prefixes {
+        must_clauses.push((Occur::Must, build_prefix_range_query(text_field, prefix)));
+    }
+
+    // Rest-Query (wenn vorhanden)
+    if !clean_non_wildcard.is_empty() {
+        let rest_str = clean_non_wildcard.join(" ");
+        if !rest_str.trim().is_empty()
+            && rest_str.trim() != "AND"
+            && rest_str.trim() != "OR"
+            && rest_str.trim() != "NOT"
+        {
+            let query_parser = QueryParser::for_index(index, vec![text_field]);
+            // Lenient: ignoriert kaputte Teile statt abzubrechen
+            let (rest_query, _errors) = query_parser.parse_query_lenient(&rest_str);
+            must_clauses.push((Occur::Must, rest_query));
+        }
+    }
+
+    if must_clauses.is_empty() {
+        // Fallback: nur Wildcards, kein Rest
+        if must_clauses.is_empty() && !wildcard_prefixes.is_empty() {
+            // Nur eine Wildcard → direkt zurueckgeben
+            return Ok(build_prefix_range_query(text_field, &wildcard_prefixes[0]));
+        }
+        let query_parser = QueryParser::for_index(index, vec![text_field]);
+        let query = query_parser.parse_query(raw_query)?;
+        return Ok(query);
+    }
+
+    if must_clauses.len() == 1 {
+        return Ok(must_clauses.into_iter().next().unwrap().1);
+    }
+
+    Ok(Box::new(BooleanQuery::new(must_clauses)))
+}
+
+/// Entfernt alleinstehende Operatoren am Anfang/Ende einer Token-Liste
+fn clean_dangling_operators<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
+    let mut result: Vec<&str> = tokens.to_vec();
+
+    // Entferne fuehrende Operatoren
+    while !result.is_empty() {
+        let first = result[0].trim().to_uppercase();
+        if first == "AND" || first == "OR" || first == "NOT" {
+            result.remove(0);
+        } else {
+            break;
+        }
+    }
+
+    // Entferne abschliessende Operatoren
+    while !result.is_empty() {
+        let last = result.last().unwrap().trim().to_uppercase();
+        if last == "AND" || last == "OR" || last == "NOT" {
+            result.pop();
+        } else {
+            break;
+        }
+    }
+
+    // Entferne doppelte Operatoren ("AND AND" → "AND")
+    let mut cleaned: Vec<&str> = Vec::new();
+    let mut last_was_op = false;
+    for t in &result {
+        let upper = t.trim().to_uppercase();
+        let is_op = upper == "AND" || upper == "OR" || upper == "NOT";
+        if is_op && last_was_op {
+            continue; // doppelten Operator ueberspringen
+        }
+        cleaned.push(t);
+        last_was_op = is_op;
+    }
+
+    cleaned
+}
+
+// ---- Oeffentliche API-Funktionen ----
+
 pub fn search_documents(query: String, top_k: usize) -> Result<Vec<SearchResult>> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    // reader를 리로드하여 최신 변경사항을 반영
     api.reader.reload()?;
-
-    // 전역 reader 재사용
     let searcher = api.reader.searcher();
 
-    let query_parser = QueryParser::for_index(&api.index, vec![api.text_field]);
-    let query = query_parser.parse_query(&query)?;
+    // Benutze den Wildcard-Fix statt direkt QueryParser::parse_query
+    let query = build_query_with_wildcard_fix(&api.index, api.text_field, &query)?;
 
     let top_docs = searcher.search(&query, &TopDocs::with_limit(top_k))?;
 
     let mut results = Vec::new();
     for (score, doc_address) in top_docs {
         let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
-        let id = retrieved_doc.get_first(api.id_field)
+        let id = retrieved_doc
+            .get_first(api.id_field)
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let text = retrieved_doc.get_first(api.text_field)
+        let text = retrieved_doc
+            .get_first(api.text_field)
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
@@ -149,14 +384,34 @@ pub fn search_documents(query: String, top_k: usize) -> Result<Vec<SearchResult>
     Ok(results)
 }
 
-// [READ] ID로 특정 문서를 가져오는 함수
-// ID 조회는 비교적 빠른 작업이므로 sync로 처리
+pub fn add_document(doc: Document) -> Result<()> {
+    let state_lock = STATE.lock().unwrap();
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+
+    let mut writer = api.writer.lock().unwrap();
+
+    let id_term = Term::from_field_text(api.id_field, &doc.id);
+    writer.delete_term(id_term.clone());
+
+    let mut tantivy_doc = TantivyDocument::new();
+    tantivy_doc.add_text(api.id_field, &doc.id);
+    tantivy_doc.add_text(api.text_field, &doc.text);
+
+    writer.add_document(tantivy_doc)?;
+    writer.commit()?;
+
+    Ok(())
+}
+
 #[flutter_rust_bridge::frb(sync)]
 pub fn get_document_by_id(id: String) -> Result<Option<Document>> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    // 전역 reader 재사용
     let searcher = api.reader.searcher();
 
     let id_term = Term::from_field_text(api.id_field, &id);
@@ -166,7 +421,8 @@ pub fn get_document_by_id(id: String) -> Result<Option<Document>> {
 
     if let Some((_, doc_address)) = top_docs.first() {
         let retrieved_doc = searcher.doc::<TantivyDocument>(*doc_address)?;
-        let text = retrieved_doc.get_first(api.text_field)
+        let text = retrieved_doc
+            .get_first(api.text_field)
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
@@ -177,17 +433,15 @@ pub fn get_document_by_id(id: String) -> Result<Option<Document>> {
     Ok(None)
 }
 
-
-// [UPDATE] 문서를 업데이트하는 함수
 pub fn update_document(doc: Document) -> Result<()> {
-    // add_document가 내부적으로 delete & add 로직을 수행하므로 그대로 호출
     add_document(doc)
 }
 
-// [DELETE] 문서를 삭제하는 함수
 pub fn delete_document(id: String) -> Result<()> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
     let mut writer = api.writer.lock().unwrap();
     let id_term = Term::from_field_text(api.id_field, &id);
@@ -198,15 +452,15 @@ pub fn delete_document(id: String) -> Result<()> {
     Ok(())
 }
 
-// [BATCH] 여러 문서를 한 번에 추가하는 함수 (성능 최적화)
 pub fn add_documents_batch(docs: Vec<Document>) -> Result<()> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
     let mut writer = api.writer.lock().unwrap();
 
     for doc in docs {
-        // 기존 문서가 있다면 삭제 (Update-or-Insert)
         let id_term = Term::from_field_text(api.id_field, &doc.id);
         writer.delete_term(id_term);
 
@@ -217,16 +471,16 @@ pub fn add_documents_batch(docs: Vec<Document>) -> Result<()> {
         writer.add_document(tantivy_doc)?;
     }
 
-    // 모든 문서를 추가한 후 한 번만 commit
     writer.commit()?;
 
     Ok(())
 }
 
-// [BATCH] 여러 문서를 한 번에 삭제하는 함수 (성능 최적화)
 pub fn delete_documents_batch(ids: Vec<String>) -> Result<()> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
     let mut writer = api.writer.lock().unwrap();
 
@@ -235,18 +489,17 @@ pub fn delete_documents_batch(ids: Vec<String>) -> Result<()> {
         writer.delete_term(id_term);
     }
 
-    // 모든 삭제 작업 후 한 번만 commit
     writer.commit()?;
 
     Ok(())
 }
 
-// [UTILITY] 명시적으로 commit을 수행하는 함수
-// add_document_no_commit과 함께 사용하여 수동으로 트랜잭션 제어
 #[flutter_rust_bridge::frb(sync)]
 pub fn commit() -> Result<()> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
     let mut writer = api.writer.lock().unwrap();
     writer.commit()?;
@@ -254,11 +507,11 @@ pub fn commit() -> Result<()> {
     Ok(())
 }
 
-// [CREATE] commit 없이 문서를 추가하는 함수 (고급 사용자용)
-// 여러 작업을 수행한 후 commit()을 호출하여 성능 최적화
 pub fn add_document_no_commit(doc: Document) -> Result<()> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
     let mut writer = api.writer.lock().unwrap();
 
@@ -274,10 +527,11 @@ pub fn add_document_no_commit(doc: Document) -> Result<()> {
     Ok(())
 }
 
-// [DELETE] commit 없이 문서를 삭제하는 함수 (고급 사용자용)
 pub fn delete_document_no_commit(id: String) -> Result<()> {
     let state_lock = STATE.lock().unwrap();
-    let api = state_lock.as_ref().ok_or_else(|| anyhow!("Tantivy not initialized"))?;
+    let api = state_lock
+        .as_ref()
+        .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
     let mut writer = api.writer.lock().unwrap();
     let id_term = Term::from_field_text(api.id_field, &id);
