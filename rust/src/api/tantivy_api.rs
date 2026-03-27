@@ -23,6 +23,7 @@ pub struct SearchResult {
 
 struct TantivyApi {
     index: Index,
+    index_path: PathBuf,
     writer: Mutex<Option<IndexWriter>>,
     reader: IndexReader,
     schema: Schema,
@@ -35,11 +36,19 @@ static STATE: Lazy<Arc<Mutex<Option<TantivyApi>>>> = Lazy::new(|| Arc::new(Mutex
 #[flutter_rust_bridge::frb(sync)]
 pub fn init_tantivy(dir_path: String) -> Result<()> {
     let mut state_lock = STATE.lock().unwrap();
-    if state_lock.is_some() {
-        return Ok(());
-    }
 
-    let index_dir = PathBuf::from(dir_path);
+    let index_dir = PathBuf::from(&dir_path);
+
+    // Bereits initialisiert mit dem gleichen Pfad → nichts tun
+    if let Some(ref api) = *state_lock {
+        if api.index_path == index_dir {
+            return Ok(());
+        }
+        // Anderer Pfad → alten State verwerfen, neu oeffnen
+    }
+    // Alten State droppen (schliesst Writer/Reader)
+    *state_lock = None;
+
     std::fs::create_dir_all(&index_dir)?;
 
     let existing = index_dir.join("meta.json").exists();
@@ -79,6 +88,7 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
 
     let api = TantivyApi {
         index,
+        index_path: index_dir,
         writer: Mutex::new(writer),
         reader,
         schema,
