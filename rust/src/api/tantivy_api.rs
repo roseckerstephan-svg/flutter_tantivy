@@ -23,7 +23,7 @@ pub struct SearchResult {
 
 struct TantivyApi {
     index: Index,
-    writer: Mutex<IndexWriter>,
+    writer: Mutex<Option<IndexWriter>>,
     reader: IndexReader,
     schema: Schema,
     id_field: Field,
@@ -42,7 +42,9 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
     let index_dir = PathBuf::from(dir_path);
     std::fs::create_dir_all(&index_dir)?;
 
-    let (index, schema) = if index_dir.join("meta.json").exists() {
+    let existing = index_dir.join("meta.json").exists();
+
+    let (index, schema) = if existing {
         let index = Index::open_in_dir(&index_dir)?;
         let schema = index.schema();
         (index, schema)
@@ -62,7 +64,13 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
         .get_field("text")
         .map_err(|_| anyhow!("'text' field not found"))?;
 
-    let writer = index.writer(50_000_000)?;
+    // Writer nur erstellen wenn der Index neu angelegt wurde.
+    // Beim reinen Lesen (lupa.exe) kein Writer → kein Lock → mehrere Nutzer gleichzeitig.
+    let writer = if existing {
+        None
+    } else {
+        Some(index.writer(50_000_000)?)
+    };
 
     let reader = index
         .reader_builder()
@@ -390,7 +398,10 @@ pub fn add_document(doc: Document) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    let mut writer = api.writer.lock().unwrap();
+    let mut writer_guard = api.writer.lock().unwrap();
+    let writer = writer_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("Index im Lesemodus geoeffnet – Schreiben nicht moeglich"))?;
 
     let id_term = Term::from_field_text(api.id_field, &doc.id);
     writer.delete_term(id_term.clone());
@@ -443,7 +454,10 @@ pub fn delete_document(id: String) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    let mut writer = api.writer.lock().unwrap();
+    let mut writer_guard = api.writer.lock().unwrap();
+    let writer = writer_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("Index im Lesemodus geoeffnet – Schreiben nicht moeglich"))?;
     let id_term = Term::from_field_text(api.id_field, &id);
 
     writer.delete_term(id_term);
@@ -458,7 +472,10 @@ pub fn add_documents_batch(docs: Vec<Document>) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    let mut writer = api.writer.lock().unwrap();
+    let mut writer_guard = api.writer.lock().unwrap();
+    let writer = writer_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("Index im Lesemodus geoeffnet – Schreiben nicht moeglich"))?;
 
     for doc in docs {
         let id_term = Term::from_field_text(api.id_field, &doc.id);
@@ -482,7 +499,10 @@ pub fn delete_documents_batch(ids: Vec<String>) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    let mut writer = api.writer.lock().unwrap();
+    let mut writer_guard = api.writer.lock().unwrap();
+    let writer = writer_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("Index im Lesemodus geoeffnet – Schreiben nicht moeglich"))?;
 
     for id in ids {
         let id_term = Term::from_field_text(api.id_field, &id);
@@ -501,7 +521,10 @@ pub fn commit() -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    let mut writer = api.writer.lock().unwrap();
+    let mut writer_guard = api.writer.lock().unwrap();
+    let writer = writer_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("Index im Lesemodus geoeffnet – Schreiben nicht moeglich"))?;
     writer.commit()?;
 
     Ok(())
@@ -513,7 +536,10 @@ pub fn add_document_no_commit(doc: Document) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    let mut writer = api.writer.lock().unwrap();
+    let mut writer_guard = api.writer.lock().unwrap();
+    let writer = writer_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("Index im Lesemodus geoeffnet – Schreiben nicht moeglich"))?;
 
     let id_term = Term::from_field_text(api.id_field, &doc.id);
     writer.delete_term(id_term);
@@ -533,7 +559,10 @@ pub fn delete_document_no_commit(id: String) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("Tantivy not initialized"))?;
 
-    let mut writer = api.writer.lock().unwrap();
+    let mut writer_guard = api.writer.lock().unwrap();
+    let writer = writer_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("Index im Lesemodus geoeffnet – Schreiben nicht moeglich"))?;
     let id_term = Term::from_field_text(api.id_field, &id);
 
     writer.delete_term(id_term);
