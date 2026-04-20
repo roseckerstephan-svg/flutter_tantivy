@@ -49,22 +49,17 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
     // Alten State droppen (schliesst Writer/Reader)
     *state_lock = None;
 
-    std::fs::create_dir_all(&index_dir)?;
+    // Read-only: Index muss bereits existieren (von build_index.py erstellt).
+    // Kein create_dir_all, kein Index::create, kein Writer → kein Lock.
+    if !index_dir.join("meta.json").exists() {
+        return Err(anyhow!(
+            "Kein Tantivy-Index in {:?}. Bitte mit python build_index.py erstellen.",
+            index_dir
+        ));
+    }
 
-    let existing = index_dir.join("meta.json").exists();
-
-    let (index, schema) = if existing {
-        let index = Index::open_in_dir(&index_dir)?;
-        let schema = index.schema();
-        (index, schema)
-    } else {
-        let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("id", STRING | STORED);
-        schema_builder.add_text_field("text", TEXT | STORED);
-        let schema = schema_builder.build();
-        let index = Index::create_in_dir(&index_dir, schema.clone())?;
-        (index, schema)
-    };
+    let index = Index::open_in_dir(&index_dir)?;
+    let schema = index.schema();
 
     let id_field = schema
         .get_field("id")
@@ -72,14 +67,6 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
     let text_field = schema
         .get_field("text")
         .map_err(|_| anyhow!("'text' field not found"))?;
-
-    // Writer nur erstellen wenn der Index neu angelegt wurde.
-    // Beim reinen Lesen (lupa.exe) kein Writer → kein Lock → mehrere Nutzer gleichzeitig.
-    let writer = if existing {
-        None
-    } else {
-        Some(index.writer(50_000_000)?)
-    };
 
     let reader = index
         .reader_builder()
@@ -89,7 +76,7 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
     let api = TantivyApi {
         index,
         index_path: index_dir,
-        writer: Mutex::new(writer),
+        writer: Mutex::new(None),
         reader,
         schema,
         id_field,
