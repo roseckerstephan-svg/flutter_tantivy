@@ -33,6 +33,69 @@ struct TantivyApi {
 
 static STATE: Lazy<Arc<Mutex<Option<TantivyApi>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
+
+/// Returns true if the error is a Tantivy lockfile error.
+/// This typically happens on SMB/network shares where LockFileEx fails
+/// with ERROR_ACCESS_DENIED (Windows code 5).
+fn is_lock_error(err: &tantivy::TantivyError) -> bool {
+    err.to_string().contains("Lockfile")
+}
+
+/// Opens a Tantivy index, with automatic fallback to a local temp-dir cache
+/// if the direct open fails due to a lock error (e.g. on SMB network shares).
+fn open_index_with_fallback(index_dir: &PathBuf) -> Result<Index> {
+    match Index::open_in_dir(index_dir) {
+        Ok(idx) => Ok(idx),
+        Err(e) if is_lock_error(&e) => open_index_via_cache(index_dir)
+            .map_err(|ce| anyhow!("SMB-Fallback fehlgeschlagen: {ce}\nOriginalfehler: {e}")),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Copies the Tantivy index to a local temp directory and opens it from there.
+/// The copy is skipped when meta.json hasn't changed since the last run.
+/// Lockfiles are intentionally excluded from the copy – they're meaningless locally.
+fn open_index_via_cache(source: &PathBuf) -> Result<Index> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::fs;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    source.to_string_lossy().hash(&mut h);
+    let cache_dir = std::env::temp_dir()
+        .join("lupa_index_cache")
+        .join(format!("{:016x}", h.finish()));
+
+    // Only re-copy when source meta.json is newer than the cached one.
+    let needs_copy = {
+        let src_mt = fs::metadata(source.join("meta.json"))
+            .and_then(|m| m.modified())
+            .ok();
+        let dst_mt = fs::metadata(cache_dir.join("meta.json"))
+            .and_then(|m| m.modified())
+            .ok();
+        match (src_mt, dst_mt) { (Some(s), Some(d)) => s != d, _ => true }
+    };
+
+    if needs_copy {
+        fs::create_dir_all(&cache_dir)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            // Skip lockfiles – they're held by the indexer and useless in the local copy.
+            if name.to_string_lossy().ends_with(".lock") {
+                continue;
+            }
+            fs::copy(entry.path(), cache_dir.join(&name))?;
+        }
+    }
+
+    Ok(Index::open_in_dir(&cache_dir)?)
+}
+
 #[flutter_rust_bridge::frb(sync)]
 pub fn init_tantivy(dir_path: String) -> Result<()> {
     let mut state_lock = STATE.lock().unwrap();
@@ -58,7 +121,7 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
         ));
     }
 
-    let index = Index::open_in_dir(&index_dir)?;
+    let index = open_index_with_fallback(&index_dir)?;
     let schema = index.schema();
 
     let id_field = schema
