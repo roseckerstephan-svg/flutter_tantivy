@@ -1,12 +1,17 @@
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
+use std::io;
 use std::ops::Bound;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tantivy::collector::TopDocs;
+use tantivy::directory::error::{DeleteError, LockError, OpenWriteError};
+use tantivy::directory::{
+    DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
+};
 use tantivy::query::{BooleanQuery, Occur, QueryParser, RangeQuery};
 use tantivy::schema::*;
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Directory, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 // Datenstrukturen fuer Flutter
 #[derive(Debug, Clone)]
@@ -34,66 +39,107 @@ struct TantivyApi {
 static STATE: Lazy<Arc<Mutex<Option<TantivyApi>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
 
-/// Returns true if the error is a Tantivy lockfile error.
-/// This typically happens on SMB/network shares where LockFileEx fails
-/// with ERROR_ACCESS_DENIED (Windows code 5).
-fn is_lock_error(err: &tantivy::TantivyError) -> bool {
-    err.to_string().contains("Lockfile")
+
+/// Directory-Wrapper, der MmapDirectory nur zum Lesen durchreicht.
+///
+/// Hintergrund: Tantivys `Index::open_in_dir` ruft intern `ManagedDirectory::wrap`
+/// auf, das den META_LOCK per `MmapDirectory::acquire_lock` holt. Dieser Call
+/// macht `OpenOptions::create(true).write(true)` und scheitert auf read-only
+/// Netzlaufwerken (SMB) mit `PermissionDenied`. Auch wenn wir den IndexWriter
+/// weglassen, wird also trotzdem versucht eine Lockdatei anzulegen.
+///
+/// `ReadOnlyDirectory` liefert fuer `acquire_lock` einen Dummy-Lock, der keinerlei
+/// Datei beruehrt. Alle echten Write-Methoden geben einen Fehler zurueck – lupa.exe
+/// darf niemals schreiben, weder auf Netzwerk noch lokal.
+#[derive(Debug, Clone)]
+struct ReadOnlyDirectory {
+    inner: MmapDirectory,
 }
 
-/// Opens a Tantivy index, with automatic fallback to a local temp-dir cache
-/// if the direct open fails due to a lock error (e.g. on SMB network shares).
-fn open_index_with_fallback(index_dir: &PathBuf) -> Result<Index> {
-    match Index::open_in_dir(index_dir) {
-        Ok(idx) => Ok(idx),
-        Err(e) if is_lock_error(&e) => open_index_via_cache(index_dir)
-            .map_err(|ce| anyhow!("SMB-Fallback fehlgeschlagen: {ce}\nOriginalfehler: {e}")),
-        Err(e) => Err(e.into()),
+impl ReadOnlyDirectory {
+    fn open(path: &Path) -> Result<Self> {
+        let inner = MmapDirectory::open(path)
+            .map_err(|e| anyhow!("MmapDirectory::open fehlgeschlagen: {e}"))?;
+        Ok(Self { inner })
     }
 }
 
-/// Copies the Tantivy index to a local temp directory and opens it from there.
-/// The copy is skipped when meta.json hasn't changed since the last run.
-/// Lockfiles are intentionally excluded from the copy – they're meaningless locally.
-fn open_index_via_cache(source: &PathBuf) -> Result<Index> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::fs;
-    use std::hash::{Hash, Hasher};
+// Dummy-Guard: haelt nichts, gibt beim Drop nichts frei.
+struct NoopLockGuard;
 
-    let mut h = DefaultHasher::new();
-    source.to_string_lossy().hash(&mut h);
-    let cache_dir = std::env::temp_dir()
-        .join("lupa_index_cache")
-        .join(format!("{:016x}", h.finish()));
-
-    // Only re-copy when source meta.json is newer than the cached one.
-    let needs_copy = {
-        let src_mt = fs::metadata(source.join("meta.json"))
-            .and_then(|m| m.modified())
-            .ok();
-        let dst_mt = fs::metadata(cache_dir.join("meta.json"))
-            .and_then(|m| m.modified())
-            .ok();
-        match (src_mt, dst_mt) { (Some(s), Some(d)) => s != d, _ => true }
-    };
-
-    if needs_copy {
-        fs::create_dir_all(&cache_dir)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            // Skip lockfiles – they're held by the indexer and useless in the local copy.
-            if name.to_string_lossy().ends_with(".lock") {
-                continue;
-            }
-            fs::copy(entry.path(), cache_dir.join(&name))?;
-        }
+impl Directory for ReadOnlyDirectory {
+    fn get_file_handle(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Arc<dyn FileHandle>, tantivy::directory::error::OpenReadError> {
+        self.inner.get_file_handle(path)
     }
 
-    Ok(Index::open_in_dir(&cache_dir)?)
+    fn open_read(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<tantivy::directory::FileSlice, tantivy::directory::error::OpenReadError>
+    {
+        self.inner.open_read(path)
+    }
+
+    fn atomic_read(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Vec<u8>, tantivy::directory::error::OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+
+    fn exists(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<bool, tantivy::directory::error::OpenReadError> {
+        self.inner.exists(path)
+    }
+
+    fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.inner.watch(callback)
+    }
+
+    // Alles ab hier ist Schreiben – im Read-Only-Modus strikt verboten.
+
+    fn delete(&self, _path: &Path) -> std::result::Result<(), DeleteError> {
+        Err(DeleteError::IoError {
+            io_error: Arc::new(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ReadOnlyDirectory: delete nicht erlaubt",
+            )),
+            filepath: _path.to_path_buf(),
+        })
+    }
+
+    fn open_write(&self, path: &Path) -> std::result::Result<WritePtr, OpenWriteError> {
+        Err(OpenWriteError::wrap_io_error(
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ReadOnlyDirectory: open_write nicht erlaubt",
+            ),
+            path.to_path_buf(),
+        ))
+    }
+
+    fn atomic_write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ReadOnlyDirectory: atomic_write nicht erlaubt",
+        ))
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        // No-op: wir schreiben nichts, also gibt's auch nichts zu syncen.
+        Ok(())
+    }
+
+    fn acquire_lock(&self, _lock: &Lock) -> std::result::Result<DirectoryLock, LockError> {
+        // Kein File anlegen, kein LockFileEx – lupa.exe liest nur.
+        // build_index.py auf dem Indexer-Host regelt Exklusivitaet per PID-Lock.
+        Ok(DirectoryLock::from(Box::new(NoopLockGuard)))
+    }
 }
 
 #[flutter_rust_bridge::frb(sync)]
@@ -121,7 +167,10 @@ pub fn init_tantivy(dir_path: String) -> Result<()> {
         ));
     }
 
-    let index = open_index_with_fallback(&index_dir)?;
+    // Index ueber ReadOnlyDirectory oeffnen – verhindert Lockfile-Writes
+    // auf dem Netzlaufwerk.
+    let directory = ReadOnlyDirectory::open(&index_dir)?;
+    let index = Index::open(directory)?;
     let schema = index.schema();
 
     let id_field = schema
